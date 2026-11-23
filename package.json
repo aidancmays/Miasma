@@ -1,0 +1,13 @@
+{
+  "name": "com.aidancmays.miasma",
+  "version": "0.1.0",
+  "displayName": "Miasma",
+  "description": "Volumetric fog for URP that fills the space: ray-marched height fog with drifting noise and local fog volumes, lit by the main light (with its shadows), additional lights and the ambient light. Settings come from Volumes, so areas and levels can each have their own fog.",
+  "unity": "6000.3",
+  "documentationUrl": "",
+  "keywords": ["urp", "fog", "volumetric", "atmosphere", "light shafts"],
+  "author": { "name": "Aidan" },
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.3.0"
+  }
+}
