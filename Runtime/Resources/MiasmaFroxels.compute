@@ -1,0 +1,205 @@
+// Froxel fog. The view frustum is cut into a small 3D grid (froxels: x and y follow the screen, z slices grow
+// exponentially with distance). Inject works out, once per froxel, how much fog is there and how much light it
+// scatters towards the camera, and blends that with last frame's (reprojected) so the jitter between frames turns
+// into smooth fog instead of a pattern. Integrate then walks each column front to back, so every froxel holds the
+// light gathered and the fraction of the background left from the camera up to it. A pixel just looks it up.
+
+#pragma kernel Inject
+#pragma kernel Integrate
+
+#define LIGHT_SHADOWS_NO_CBUFFER
+#define _MAIN_LIGHT_SHADOWS_CASCADE
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+
+RWTexture3D<float4> _MiasmaInjected;        // this frame: rgb = scattered light per metre, a = extinction per metre
+Texture3D<float4> _MiasmaHistory;          // last frame's injected
+RWTexture3D<float4> _MiasmaIntegrated;      // rgb = light gathered from the camera up to here, a = transmittance
+Texture3D<float4> _MiasmaInjectedRead;
+// sampler_LinearClamp comes from the core library.
+
+float4 _MiasmaGrid;          // width, height, depth, frame
+float4 _MiasmaSlices;        // near, far, log(far / near), jitter (0-1)
+float4x4 _MiasmaInvViewProj; // this frame, for froxel rays
+float4x4 _MiasmaPrevViewProj;
+float4 _MiasmaCamera;        // camera position, history weight (0 = none)
+float4 _MiasmaPrevCamera;    // last frame's camera position
+
+float4 _MiasmaDensity;       // density, base height, height falloff, noise amount
+float4 _MiasmaNoise;         // 1 / noise size, wind xyz
+float4 _MiasmaTime;          // time
+float4 _MiasmaLight;         // forward scattering, main light, other lights, ambient
+float4 _MiasmaAlbedo;
+float4 _MiasmaMainDirection; // towards the main light, w = shadows on
+float4 _MiasmaMainColour;
+float4 _MiasmaAmbient;
+
+float _MiasmaLightCount;
+float4 _MiasmaLightPositions[32];  // xyz, w = 1 / range²
+float4 _MiasmaLightColours[32];    // rgb, w = spot (1) or point (0)
+float4 _MiasmaLightSpots[32];      // spot direction xyz, w = unused
+float4 _MiasmaLightSpotAngles[32]; // x = scale, y = offset (URP spot attenuation)
+
+float _MiasmaVolumeCount;
+float4x4 _MiasmaVolumeMatrices[16];
+float4 _MiasmaVolumeParams[16];    // density, edge, noise
+
+float SliceDistance(float slice)
+{
+    return _MiasmaSlices.x * exp(slice / _MiasmaGrid.z * _MiasmaSlices.z);
+}
+
+float DistanceToSlice(float d)
+{
+    return log(max(d, _MiasmaSlices.x) / _MiasmaSlices.x) / _MiasmaSlices.z * _MiasmaGrid.z;
+}
+
+float3 FroxelRay(float2 uv)
+{
+    // OpenGL-style matrices from the CPU: uv (0, 0) is the bottom left, like sampling a camera texture.
+    float4 ndc = float4(uv * 2.0 - 1.0, 0.0, 1.0);
+    float4 world = mul(_MiasmaInvViewProj, ndc);
+    return normalize(world.xyz / world.w - _MiasmaCamera.xyz);
+}
+
+float Hash(float3 p)
+{
+    p = frac(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return frac(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float ValueNoise(float3 x)
+{
+    float3 i = floor(x);
+    float3 f = frac(x);
+    f = f * f * (3.0 - 2.0 * f);
+    return lerp(lerp(lerp(Hash(i), Hash(i + float3(1, 0, 0)), f.x),
+                     lerp(Hash(i + float3(0, 1, 0)), Hash(i + float3(1, 1, 0)), f.x), f.y),
+                lerp(lerp(Hash(i + float3(0, 0, 1)), Hash(i + float3(1, 0, 1)), f.x),
+                     lerp(Hash(i + float3(0, 1, 1)), Hash(i + float3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+float Density(float3 p)
+{
+    float3 q = (p - _MiasmaNoise.yzw * _MiasmaTime.x) * _MiasmaNoise.x;
+    float patches = saturate((ValueNoise(q) * 0.65 + ValueNoise(q * 2.13 + 17.1) * 0.35) * 1.6 - 0.3) * 2.0;
+
+    float height = max(p.y - _MiasmaDensity.y, 0.0);
+    float d = _MiasmaDensity.x * exp(-height * _MiasmaDensity.z) * lerp(1.0, patches, _MiasmaDensity.w);
+
+    int count = (int)_MiasmaVolumeCount;
+    for (int i = 0; i < count; i++)
+    {
+        float3 local = mul(_MiasmaVolumeMatrices[i], float4(p, 1.0)).xyz;
+        float3 fade = saturate((0.5 - abs(local)) / _MiasmaVolumeParams[i].y);
+        float w = fade.x * fade.y * fade.z;
+        d += _MiasmaVolumeParams[i].x * w * lerp(1.0, patches, _MiasmaVolumeParams[i].z);
+    }
+    return max(d, 0.0);
+}
+
+// Henyey-Greenstein, scaled so an even (g = 0) phase is 1.
+float Phase(float cosTheta, float g)
+{
+    float g2 = g * g;
+    return (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4), 1.5);
+}
+
+[numthreads(8, 8, 1)]
+void Inject(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_MiasmaGrid.xyz)) return;
+
+    // Each frame samples a different spot inside the froxel (R2 sequence); blended over frames, a froxel holds the
+    // average over its whole cell instead of its centre, so a light's edge falls smoothly across cells, not in blocks.
+    float2 jitter = frac(_MiasmaGrid.w * float2(0.7548776662, 0.5698402910));
+    float2 uv = (id.xy + jitter) / _MiasmaGrid.xy;
+    float3 ray = FroxelRay(uv);
+    float t = SliceDistance(id.z + _MiasmaSlices.w);
+    float3 p = _MiasmaCamera.xyz + ray * t;
+
+    float extinction = Density(p);
+    float3 light = _MiasmaAmbient.rgb * _MiasmaLight.w;
+
+    float shadow = 1.0;
+    if (_MiasmaMainDirection.w > 0.5)
+        shadow = MainLightRealtimeShadow(TransformWorldToShadowCoord(p));
+    light += _MiasmaMainColour.rgb * shadow * Phase(dot(ray, _MiasmaMainDirection.xyz), _MiasmaLight.x) * _MiasmaLight.y;
+
+    int lights = (int)_MiasmaLightCount;
+    for (int i = 0; i < lights; i++)
+    {
+        float3 toLight = _MiasmaLightPositions[i].xyz - p;
+        float d2 = dot(toLight, toLight);
+        float3 l = toLight * rsqrt(d2);
+        // URP's attenuation: inverse square, faded smoothly to 0 at the light's range.
+        float window = saturate(1.0 - Sq(d2 * _MiasmaLightPositions[i].w));
+        // Softened inverse square: a metre round the bulb is lit evenly rather than peaking at it, so neighbouring
+        // froxels never differ by much (that difference showed as blocks), and the glow doesn't flicker.
+        float attenuation = window * window / (d2 + 1.0);
+        if (_MiasmaLightColours[i].w > 0.5)
+        {
+            float cd = dot(_MiasmaLightSpots[i].xyz, -l);
+            float spot = saturate(cd * _MiasmaLightSpotAngles[i].x + _MiasmaLightSpotAngles[i].y);
+            attenuation *= spot * spot;
+        }
+        // Even phase for small lights: a halo round them, not a streak across the whole view.
+        light += _MiasmaLightColours[i].rgb * attenuation * _MiasmaLight.z;
+    }
+
+    float4 current = float4(light * _MiasmaAlbedo.rgb * extinction, extinction);
+
+    // Blend with last frame's, at the same world point.
+    float historyWeight = _MiasmaCamera.w;
+    if (historyWeight > 0.0)
+    {
+        float4 clip = mul(_MiasmaPrevViewProj, float4(p, 1.0));
+        if (clip.w > 0.0)
+        {
+            float2 prevUv = clip.xy / clip.w * 0.5 + 0.5;
+            float prevSlice = DistanceToSlice(length(p - _MiasmaPrevCamera.xyz)) - 0.5;
+            float3 prevUvw = float3(prevUv, (prevSlice + 0.5) / _MiasmaGrid.z);
+            // Fog that was just outside last frame's grid (the edges of the view when backing away, the far end when
+            // walking forwards) still blends with the nearest of last frame's, fading out over two froxels, so the
+            // edge of last frame's view never shows as a rectangle between smoothed and fresh fog.
+            float3 texel = 1.0 / _MiasmaGrid.xyz;
+            float3 clamped = clamp(prevUvw, texel * 0.5, 1.0 - texel * 0.5);
+            float outside = max(max(abs(prevUvw.x - clamped.x) * _MiasmaGrid.x, abs(prevUvw.y - clamped.y) * _MiasmaGrid.y),
+                                abs(prevUvw.z - clamped.z) * _MiasmaGrid.z);
+            float weight = historyWeight * saturate(1.0 - outside * 0.5);
+            if (weight > 0.0)
+            {
+                float4 history = _MiasmaHistory.SampleLevel(sampler_LinearClamp, clamped, 0);
+                current = lerp(current, history, weight);
+            }
+        }
+    }
+    _MiasmaInjected[id] = current;
+}
+
+[numthreads(8, 8, 1)]
+void Integrate(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= (uint2)_MiasmaGrid.xy)) return;
+
+    float3 gathered = 0.0;
+    float transmittance = 1.0;
+    float previous = 0.0;
+    int depth = (int)_MiasmaGrid.z;
+    for (int z = 0; z < depth; z++)
+    {
+        float4 froxel = _MiasmaInjectedRead[uint3(id.xy, z)];
+        float far = SliceDistance(z + 1.0);
+        float sliceLength = far - previous;
+        previous = far;
+
+        float extinction = max(froxel.a, 1e-6);
+        float stepTransmittance = exp(-extinction * sliceLength);
+        // Light scattered within the slice, dimmed by the fog in front of it (energy conserving).
+        gathered += transmittance * froxel.rgb * (1.0 - stepTransmittance) / extinction;
+        transmittance *= stepTransmittance;
+        _MiasmaIntegrated[uint3(id.xy, z)] = float4(gathered, transmittance);
+    }
+}

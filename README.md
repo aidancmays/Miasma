@@ -1,16 +1,18 @@
 # Miasma
 
-Volumetric fog for URP that fills the space. Every frame it marches along each pixel's view ray through height fog
-broken into drifting patches, plus any local fog volumes, and gathers the light the fog scatters towards the camera:
-the main light (sun or moon) in and out of its shadows, which gives shafts; other lights such as torches, with their
-shadows; and the ambient light. What lies behind fades by how much fog is in front of it.
+Volumetric fog for URP that fills the space. The view is cut into a small 3D grid of froxels (x and y follow the
+screen, depth slices grow with distance). Once per froxel, a compute shader works out how much fog is there (height fog
+broken into drifting patches, plus any Fog Volumes) and the light it scatters towards the camera: the main light (sun
+or moon) in and out of its shadows, which gives shafts; other lights such as torches, within their range; and the
+ambient light. Each frame is blended with the last, so the fog is smooth. Each pixel then looks up the fog at its
+distance, and beyond the grid the height fog carries on to the horizon, so distant things fade out progressively.
 
 It runs before transparent objects and post-processing, so a grade or a print (Chromolithograph) after it sees the fog.
 
 ## Requirements
 
 - Unity 6.3 (6000.3) or newer, Universal Render Pipeline 17.3, Render Graph (the default)
-- The renderer's Depth Texture on (the feature asks for it)
+- The renderer's Depth Texture on (the feature asks for it), and compute shader support
 
 ## Set up
 
@@ -29,10 +31,11 @@ It runs before transparent objects and post-processing, so a grade or a print (C
 | Albedo | Colour of the fog itself. |
 | Forward Scattering | Glow towards lights you look towards (halos, shafts). |
 | Main Light, Other Lights, Ambient | How much each kind of light shows in the fog. |
-| Distance | How far the fog is marched. |
+| Distance | Depth of the froxel grid. Shadows, patches, fog volumes and other lights show up to here; beyond it the height fog carries on evenly. |
 
-On the feature: **Steps** (quality against speed), **Half Resolution**, **Other Lights** (off saves the most), and
-**Scene View**.
+On the feature: **Method** (Marched: each pixel's ray, with **Steps** and **Half Resolution**; or Froxels: a 3D grid,
+with **Quality** and **Smoothing**), **Layer** (Painted watercolour over the finished frame, or In Scene),
+**Other Lights**, **Scene View** and **Share Visibility**.
 
 ## From code
 
@@ -48,9 +51,16 @@ volume.priority = 100;
 volume.sharedProfile = profile;
 ```
 
+## With a print or outline effect
+
+With **Share Visibility** on, the fog shares how much of each pixel shows through it as the global texture
+`_ChromoVisibility` (R: 1 = clear) and sets `_ChromoVisibilityOn` to 1 before transparents. Chromolithograph 0.3 reads
+it and fades its key lines, hatching and grain where the fog hides the scene, so fogged things print as flat washes.
+Any other effect can read it the same way.
+
 ## Notes
 
 - Up to 16 Fog Volumes are drawn at once (the nearest to the camera).
-- The fog is marched at half resolution and laid over the frame with a soft upsample, so very thin objects in front of
-  thick fog can show a faint fringe.
-- Cost grows with Steps, with the number of lights touching the fog, and with their shadows.
+- The grid is coarse, so fog edges and shafts are soft; fast-moving lights leave a short trail (Smoothing).
+- Other lights don't cast shadows into the fog (a torch behind a wall still glows through it a little).
+- Cost grows with Quality and with the number of other lights (up to 32).

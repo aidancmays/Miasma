@@ -39,6 +39,9 @@ namespace Miasma
         [Tooltip("Colour of the fog itself (what it does to the light passing through it).")]
         public ColorParameter albedo = new(new Color(0.9f, 0.9f, 0.9f), false, false, true);
 
+        [Tooltip("How much the fog swallows light instead of glowing with it. 0 = it lights up with the lamps and ambient light around it (real fog); 1 = it hides things just as much but gives back no light, engulfing everything in darkness.")]
+        public ClampedFloatParameter cimmerian = new(0f, 0f, 1f);
+
         [Tooltip("How much the fog glows towards a light you look towards (0 = the same from every side; 0.6 = strong halos and shafts).")]
         public ClampedFloatParameter forwardScattering = new(0.45f, -0.9f, 0.9f);
 
@@ -46,14 +49,39 @@ namespace Miasma
         public MinFloatParameter mainLight = new(1f, 0f);
 
         [Tooltip("Strength of other lights (torches, lanterns) in the fog.")]
-        public MinFloatParameter otherLights = new(1f, 0f);
+        public MinFloatParameter otherLights = new(0.5f, 0f);
 
         [Tooltip("Strength of the ambient light in the fog.")]
         public MinFloatParameter ambient = new(1f, 0f);
 
+        [Header("Painted")]
+        [Tooltip("Painted layer only: how much the fog is laid as a few overlapping washes with soft edges, instead of a smooth gradient.")]
+        public ClampedFloatParameter washSteps = new(0.25f, 0f, 1f);
+
+        [Tooltip("Painted layer only: pigment gathering in patches with cauliflower edges, as a wash spreads on wet paper.")]
+        public ClampedFloatParameter blooms = new(0.6f, 0f, 1f);
+
+        [Tooltip("Painted layer only: how fast the blooms change shape, in seconds per shape (they morph in place, never slide). 0 = still.")]
+        public MinFloatParameter bloomMorphSeconds = new(40f, 0f);
+
+        [Tooltip("Painted layer only: pigment settling into the paper's tooth.")]
+        public ClampedFloatParameter granulation = new(0.5f, 0f, 1f);
+
+        [Tooltip("Painted layer only: darker rims where a wash dried.")]
+        public ClampedFloatParameter wetEdges = new(0.5f, 0f, 1f);
+
+        [Tooltip("Painted layer only: size of the blooms and grain (1 = default).")]
+        public MinFloatParameter pigmentSize = new(1f, 0.1f);
+
+        [Tooltip("Painted layer only: brightness of the fog's own colour before it is laid as paint.")]
+        public MinFloatParameter paintExposure = new(1f, 0f);
+
+        [Tooltip("Painted layer only: a pigment colour for the fog (alpha = how much it replaces the fog's lit colour).")]
+        public ColorParameter pigment = new(new Color(0.35f, 0.33f, 0.3f, 0f), false, true, true);
+
         [Header("Range")]
-        [Tooltip("How far the fog is marched, in metres. Things further away get the fog of this distance.")]
-        public MinFloatParameter distance = new(80f, 1f);
+        [Tooltip("Depth of the froxel grid, in metres: shadows, patches, fog volumes and other lights show up to here. Beyond it the height fog carries on, evenly.")]
+        public MinFloatParameter distance = new(100f, 5f);
 
         /// <summary>True when this override makes any fog.</summary>
         public bool IsActive() => density.value > 0f;
